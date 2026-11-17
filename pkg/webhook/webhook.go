@@ -99,17 +99,18 @@ func mutationRequired(metadata *metav1.ObjectMeta) bool {
 	return required
 }
 
-func addContainers(target, added []corev1.Container, basePath string) (patch []patchOperation) {
+// prependContainers creates a patch that inserts the added containers before the target ones.
+func prependContainers(target, added []corev1.Container, basePath string) (patch []patchOperation) {
 	first := len(target) == 0
 	var value interface{}
-	for _, add := range added {
+	for i, add := range added {
 		value = add
 		path := basePath
 		if first {
 			first = false
 			value = []corev1.Container{add}
 		} else {
-			path = path + "/-"
+			path = fmt.Sprintf("%s/%d", basePath, i)
 		}
 		patch = append(patch, patchOperation{
 			Op:    "add",
@@ -233,7 +234,7 @@ func (s *SecretInjector) mutate(ar *admissionv1.AdmissionReview) *admissionv1.Ad
 		if !mutate {
 			continue
 		}
-		didMutate, initContainerPatch, err := s.mutateContainer(ctx, &c, i)
+		didMutate, initContainerPatch, err := s.mutateContainer(ctx, &c, i, "/spec/initContainers")
 		if err != nil {
 			return &admissionv1.AdmissionResponse{
 				Result: &metav1.Status{
@@ -254,7 +255,7 @@ func (s *SecretInjector) mutate(ar *admissionv1.AdmissionReview) *admissionv1.Ad
 			continue
 		}
 
-		didMutate, containerPatch, err := s.mutateContainer(ctx, &c, i)
+		didMutate, containerPatch, err := s.mutateContainer(ctx, &c, i, "/spec/containers")
 		if err != nil {
 			glog.Error("Error occurred mutating container for secret injection: ", err)
 			return &admissionv1.AdmissionResponse{
@@ -317,7 +318,8 @@ func createOPCLIPatch(pod *corev1.Pod, containers []corev1.Container, patch []pa
 
 	annotations := map[string]string{injectionStatus: "injected"}
 	patch = append(patch, addVolume(pod.Spec.Volumes, []corev1.Volume{binVolume}, "/spec/volumes")...)
-	patch = append(patch, addContainers(pod.Spec.InitContainers, containers, "/spec/initContainers")...)
+	// Prepended only now, so that the init container indexes used in the patch so far still hold.
+	patch = append(patch, prependContainers(pod.Spec.InitContainers, containers, "/spec/initContainers")...)
 	patch = append(patch, updateAnnotation(pod.Annotations, annotations)...)
 
 	return json.Marshal(patch)
@@ -367,7 +369,7 @@ func checkOPCLIEnvSetup(container *corev1.Container) {
 	}
 }
 
-func passUserAgentInformationToCLI(container *corev1.Container, containerIndex int) []patchOperation {
+func passUserAgentInformationToCLI(container *corev1.Container, containerIndex int, basePath string) []patchOperation {
 	userAgentEnvs := []corev1.EnvVar{
 		{
 			Name:  "OP_INTEGRATION_NAME",
@@ -383,11 +385,11 @@ func passUserAgentInformationToCLI(container *corev1.Container, containerIndex i
 		},
 	}
 
-	return setEnvironment(*container, containerIndex, userAgentEnvs, "/spec/containers")
+	return setEnvironment(*container, containerIndex, userAgentEnvs, basePath)
 }
 
 // mutates the container to allow for secrets to be injected into the container via the op cli
-func (s *SecretInjector) mutateContainer(cxt context.Context, container *corev1.Container, containerIndex int) (bool, []patchOperation, error) {
+func (s *SecretInjector) mutateContainer(cxt context.Context, container *corev1.Container, containerIndex int, basePath string) (bool, []patchOperation, error) {
 	//  prepending op run command to the container command so that secrets are injected before the main process is started
 	if len(container.Command) == 0 {
 		return false, nil, fmt.Errorf("not attaching OP to the container %s: the podspec does not define a command", container.Name)
@@ -399,7 +401,7 @@ func (s *SecretInjector) mutateContainer(cxt context.Context, container *corev1.
 	var patch []patchOperation
 
 	// adding the cli to the container using a volume mount
-	path := fmt.Sprintf("%s/%d/volumeMounts", "/spec/containers", containerIndex)
+	path := fmt.Sprintf("%s/%d/volumeMounts", basePath, containerIndex)
 	patch = append(patch, patchOperation{
 		Op:    "add",
 		Path:  path,
@@ -407,7 +409,7 @@ func (s *SecretInjector) mutateContainer(cxt context.Context, container *corev1.
 	})
 
 	// replacing the container command with a command prepended with op run
-	path = fmt.Sprintf("%s/%d/command", "/spec/containers", containerIndex)
+	path = fmt.Sprintf("%s/%d/command", basePath, containerIndex)
 	patch = append(patch, patchOperation{
 		Op:    "replace",
 		Path:  path,
@@ -417,7 +419,7 @@ func (s *SecretInjector) mutateContainer(cxt context.Context, container *corev1.
 	checkOPCLIEnvSetup(container)
 
 	//creating patch for passing User-Agent information to the CLI.
-	patch = append(patch, passUserAgentInformationToCLI(container, containerIndex)...)
+	patch = append(patch, passUserAgentInformationToCLI(container, containerIndex, basePath)...)
 	return true, patch, nil
 }
 

@@ -52,6 +52,26 @@ func sendPodAndGetResponse(pod corev1.Pod, rr *httptest.ResponseRecorder, handle
 	return parseResponseBody(rr)
 }
 
+// sendPodAndApplyPatch returns the pod with the webhook's patch applied, as the API server would persist it.
+func sendPodAndApplyPatch(pod corev1.Pod, rr *httptest.ResponseRecorder, handler http.HandlerFunc) corev1.Pod {
+	GinkgoHelper()
+
+	raw, err := json.Marshal(pod)
+	Expect(err).NotTo(HaveOccurred())
+
+	responseBody := sendPodAndGetResponse(pod, rr, handler)
+	Expect(responseBody.Patch).NotTo(BeNil())
+
+	patch, err := jsonpatch.DecodePatch(responseBody.Patch)
+	Expect(err).NotTo(HaveOccurred())
+	patchedRaw, err := patch.Apply(raw)
+	Expect(err).NotTo(HaveOccurred())
+
+	var patched corev1.Pod
+	Expect(json.Unmarshal(patchedRaw, &patched)).To(Succeed())
+	return patched
+}
+
 var testNotPatch = map[string]struct {
 	pod corev1.Pod
 }{
@@ -308,4 +328,70 @@ var _ = Describe("Webhook Test", Ordered, func() {
 		})
 	})
 
+	Context("init containers", func() {
+		It("adds copy-op-bin when the pod has no init containers", func() {
+			pod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"operator.1password.io/inject": "app",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Command: []string{"sleep", "infinity"}},
+					},
+				},
+			}
+
+			patched := sendPodAndApplyPatch(pod, rr, handler)
+
+			Expect(patched.Spec.InitContainers).To(HaveExactElements(
+				HaveField("Name", "copy-op-bin"),
+			))
+		})
+
+		When("an init container is listed in the inject annotation", func() {
+			var pod, patched corev1.Pod
+
+			BeforeEach(func() {
+				pod = corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							"operator.1password.io/inject": "migrate",
+						},
+					},
+					Spec: corev1.PodSpec{
+						InitContainers: []corev1.Container{
+							{Name: "wait-for-db", Command: []string{"sleep", "1"}},
+							{Name: "migrate", Command: []string{"migrate", "up"}},
+						},
+						Containers: []corev1.Container{
+							{Name: "app", Command: []string{"sleep", "infinity"}},
+						},
+					},
+				}
+				patched = sendPodAndApplyPatch(pod, rr, handler)
+			})
+
+			It("runs copy-op-bin before the pod's own init containers", func() {
+				Expect(patched.Spec.InitContainers).To(HaveExactElements(
+					HaveField("Name", "copy-op-bin"),
+					HaveField("Name", "wait-for-db"),
+					HaveField("Name", "migrate"),
+				))
+			})
+
+			It("injects secrets into the listed init container", func() {
+				migrate := patched.Spec.InitContainers[2]
+				Expect(migrate.Command).To(Equal([]string{"/op/bin/op", "run", "--", "migrate", "up"}))
+				Expect(migrate.VolumeMounts).To(ContainElement(binVolumeMount))
+				Expect(migrate.Env).To(ContainElement(HaveField("Name", "OP_INTEGRATION_NAME")))
+			})
+
+			It("leaves the containers that are not listed untouched", func() {
+				Expect(patched.Spec.InitContainers[1]).To(Equal(pod.Spec.InitContainers[0]))
+				Expect(patched.Spec.Containers).To(Equal(pod.Spec.Containers))
+			})
+		})
+	})
 })

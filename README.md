@@ -31,10 +31,26 @@ spec:
   template:
     metadata:
       annotations:
-        operator.1password.io/inject: "app-example1"
+        operator.1password.io/inject: "db-migration,app-example1"
       labels:
         app: app-example
     spec:
+      initContainers:
+        - name: db-migration # init containers are injected too
+          image: my-image
+          command: ["npm"]
+          args: ["run", "migrate"]
+          env:
+          - name: OP_CONNECT_HOST
+            value: http://onepassword-connect:8080
+          - name: OP_CONNECT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: connect-token
+                key: token
+          - name: DB_PASSWORD
+            value: op://my-vault/my-item/sql/password
+
       containers:
         - name: app-example1
           image: my-image
